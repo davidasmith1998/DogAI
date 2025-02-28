@@ -1,0 +1,464 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pickle
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision.datasets import ImageFolder
+import torchvision.transforms as transforms
+import torch.optim.lr_scheduler as lr_scheduler
+
+import timm
+from tqdm import tqdm
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    cohen_kappa_score,
+    roc_curve,
+    precision_recall_curve,
+    auc
+)
+from sklearn.model_selection import GroupKFold
+
+from torch.cuda.amp import GradScaler
+
+# ------------------------ 1. Global Config ------------------------
+torch.manual_seed(221)
+np.random.seed(221)
+random.seed(221)
+
+# Enable cuDNN benchmarking for speed when input sizes are constant.
+torch.backends.cudnn.benchmark = True
+
+BATCH_SIZE = 16
+IMAGE_SIZE = 384
+NUM_CLASSES = 2
+NUM_EPOCHS = 16
+ALPHA = 0  # Mixup alpha; set >0 if you want mixup
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+MODEL_ARCH = "vit_small_patch16_384.augreg_in21k_ft_in1k"
+
+# ------------------------ 2. Mixup Functions ------------------------
+def mixup_data(x, y, alpha=ALPHA):
+    """Returns mixed inputs, pairs of targets, and lambda."""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Mixup-adjusted criterion."""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+# ------------------------ 3. Loss Criterion ------------------------
+criterion = nn.CrossEntropyLoss()
+
+# ------------------------ 4. Custom Dataset ------------------------
+class CustomDataset(Dataset):
+    """
+    Custom dataset that uses the extension-less image name to look up metadata.
+    """
+    def __init__(self, img_dir, metadata, transform=None):
+        self.dataset = ImageFolder(img_dir, transform=transform)
+        self.imgs = self.dataset.imgs
+        self.transform = transform
+        self.metadata = metadata
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, idx):
+        img, label = self.dataset[idx]
+        full_name = os.path.basename(self.imgs[idx][0])
+        name_no_ext = os.path.splitext(full_name)[0]
+        dog_id = self.metadata.loc[name_no_ext, 'DogID']
+        return img, label, dog_id
+
+# ------------------------ 5. Transforms ------------------------
+train_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomRotation(degrees=(-20, 20)),
+    transforms.RandomAffine(degrees=(-10, 10), translate=(0.1, 0.1), scale=(0.9, 1.1)),
+    transforms.RandomApply([transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2)], p=0.5),
+    transforms.RandomApply([transforms.RandomAdjustSharpness(sharpness_factor=2.0)], p=0.5),
+    transforms.PILToTensor(),
+    transforms.ConvertImageDtype(torch.float32),
+    transforms.RandomErasing(p=0.5, scale=(0.1, 0.15)),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# Use non-augmented transforms for validation and testing.
+test_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.PILToTensor(),
+    transforms.ConvertImageDtype(torch.float32),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# ------------------------ 6. Load Metadata ------------------------
+metadata_path = "/kaggle/input/metadatacolored/final_metadata.xlsx"
+metadata_df = pd.read_excel(metadata_path)
+# Remove file extensions from 'ImageName'
+metadata_df["ImageName"] = metadata_df["ImageName"].apply(lambda x: os.path.splitext(x)[0])
+metadata_df.set_index("ImageName", inplace=True)
+
+# ------------------------ 7. Create Dataset & DataLoaders ------------------------
+# Training dataset with augmentation
+train_dataset = CustomDataset("/kaggle/input/trainingcolored", metadata_df, transform=train_transform)
+# Test dataset (held-out) with test transforms
+test_dataset  = CustomDataset("/kaggle/input/testingcolored", metadata_df, transform=test_transform)
+
+# Create a test DataLoader (we use the full test set for every fold)
+test_loader  = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+# ------------------------ 8. Model Definition ------------------------
+class ViTSmallPatch16AugRegModel(nn.Module):
+    """
+    Loads a timm ViT model and replaces its head for 2-class classification.
+    """
+    def __init__(self, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.model = timm.create_model(
+            MODEL_ARCH,
+            pretrained=True,
+            num_classes=num_classes
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+# ------------------------ 9. Combined Evaluation Function ------------------------
+def evaluate_model(model, data_loader, criterion, device):
+    """
+    Evaluates the model on a data loader and returns:
+    y_true, y_pred, y_scores, avg_loss, and accuracy.
+    """
+    model.eval()
+    y_true, y_pred, y_scores = [], [], []
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    with torch.inference_mode():
+        for inputs, labels, _ in data_loader:  # DogID not used
+            inputs, labels = inputs.to(device), labels.to(device)
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(device.type=="cuda")):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                probs = torch.softmax(outputs, dim=1)
+                y_score = probs[:, 1]  # Probability for positive class
+                _, preds = torch.max(outputs, 1)
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
+            y_scores.extend(y_score.cpu().numpy())
+            total_loss += loss.item() * inputs.size(0)
+            total_correct += preds.eq(labels).sum().item()
+            total_samples += labels.size(0)
+
+    avg_loss = total_loss / total_samples
+    accuracy = total_correct / total_samples
+    return y_true, y_pred, y_scores, avg_loss, accuracy
+
+# ------------------------ 10. Training Function with Validation ------------------------
+def train_model(train_loader, val_loader, model_class, criterion, device, num_epochs=NUM_EPOCHS, alpha=ALPHA, fold=None):
+    if fold is not None:
+        print(f"\nTraining model for fold {fold}...")
+    else:
+        print("Training model on the full training set...")
+
+    model = model_class(num_classes=NUM_CLASSES).to(device)
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs for DataParallel.")
+        model = nn.DataParallel(model)
+
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    scaler = GradScaler()
+
+    history = {
+        "epoch": [],
+        "train_loss": [],
+        "train_accuracy": [],
+        "val_loss": [],
+        "val_accuracy": []
+    }
+    best_val_loss = float("inf")
+    best_model_state = None
+
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        for inputs, labels, _ in tqdm(train_loader, desc=f"Fold {fold} - Epoch {epoch+1}/{num_epochs}"):
+            inputs, labels = inputs.to(device), labels.to(device)
+            inputs, targets_a, targets_b, lam = mixup_data(inputs, labels, alpha)
+
+            optimizer.zero_grad()
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(device.type=="cuda")):
+                outputs = model(inputs)
+                loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+                _, preds = torch.max(outputs, 1)
+                correct_batch = (lam * preds.eq(targets_a).sum().float() +
+                                 (1 - lam) * preds.eq(targets_b).sum().float()).item()
+
+            scaler.scale(loss).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            running_loss += loss.item() * inputs.size(0)
+            correct += correct_batch
+            total += labels.size(0)
+
+        epoch_train_loss = running_loss / len(train_loader.dataset)
+        epoch_train_acc = correct / total
+
+        # Combined evaluation on validation set (loss & accuracy in one pass)
+        _, _, _, epoch_val_loss, epoch_val_acc = evaluate_model(model, val_loader, criterion, device)
+
+        print(f"Fold {fold} - Epoch {epoch+1}/{num_epochs} | Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.4f} | Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_acc:.4f}")
+
+        history["epoch"].append(epoch + 1)
+        history["train_loss"].append(epoch_train_loss)
+        history["train_accuracy"].append(epoch_train_acc)
+        history["val_loss"].append(epoch_val_loss)
+        history["val_accuracy"].append(epoch_val_acc)
+
+        scheduler.step()
+
+        # (Optional) Save checkpoint less frequently if needed.
+        checkpoint_name = f"fold_{fold}_epoch_{epoch+1}_model.pth" if fold is not None else f"epoch_{epoch+1}_model.pth"
+        torch.save(model.state_dict(), checkpoint_name)
+
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            best_model_state = model.state_dict().copy()
+
+    if best_model_state is not None:
+        best_checkpoint_name = f"fold_{fold}_best_model.pth" if fold is not None else "best_model.pth"
+        torch.save(best_model_state, best_checkpoint_name)
+        print(f"Best model for fold {fold} saved with Val Loss: {best_val_loss:.4f}")
+
+    return model, history
+
+def plot_training_progress(history):
+    epochs = history["epoch"]
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, history["train_loss"], label="Train Loss")
+    plt.plot(epochs, history["val_loss"], label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss Over Epochs")
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, history["train_accuracy"], label="Train Accuracy")
+    plt.plot(epochs, history["val_accuracy"], label="Val Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title("Accuracy Over Epochs")
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------ 11. Set Up 5-Fold Cross Validation ------------------------
+groups = []
+for idx in range(len(train_dataset)):
+    full_name = os.path.basename(train_dataset.imgs[idx][0])
+    name_no_ext = os.path.splitext(full_name)[0]
+    dog_id = train_dataset.metadata.loc[name_no_ext, 'DogID']
+    groups.append(dog_id)
+
+num_folds = 5  # Adjust number of folds as needed.
+gkf = GroupKFold(n_splits=num_folds)
+fold_metrics = []      # For overall fold metrics
+fold_histories = {}    # For epoch-wise history per fold
+
+all_indices = np.arange(len(train_dataset))
+fold_predictions = {}
+
+for fold, (train_idx, val_idx) in enumerate(gkf.split(all_indices, groups=groups), start=1):
+    print(f"\n========== Fold {fold}/{num_folds} ==========")
+    train_subset = torch.utils.data.Subset(train_dataset, train_idx)
+    train_loader_fold = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    
+    val_dataset = torch.utils.data.Subset(
+        CustomDataset("/kaggle/input/trainingcolored", metadata_df, transform=test_transform),
+        val_idx
+    )
+    val_loader_fold = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+    model, history = train_model(train_loader_fold, val_loader_fold, ViTSmallPatch16AugRegModel, criterion, DEVICE,
+                                 num_epochs=NUM_EPOCHS, alpha=ALPHA, fold=fold)
+    fold_histories[f"fold_{fold}"] = history
+
+    y_true, y_pred, y_scores, test_loss, _ = evaluate_model(model, test_loader, criterion, DEVICE)
+
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    mcc = matthews_corrcoef(y_true, y_pred)
+    kappa = cohen_kappa_score(y_true, y_pred)
+    try:
+        auc_score = roc_auc_score(y_true, y_scores)
+    except ValueError:
+        auc_score = np.nan
+
+    fold_metrics.append({
+        "fold": fold,
+        "test_loss": test_loss,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "mcc": mcc,
+        "kappa": kappa,
+        "auc": auc_score
+    })
+
+    fold_predictions[f"fold_{fold}"] = {
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "y_scores": y_scores
+    }
+
+    print(f"\nFold {fold} Results on Test Set:")
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Accuracy: {accuracy:.4f}")
+    print(f"Test Precision: {precision:.4f}")
+    print(f"Test Recall: {recall:.4f}")
+    print(f"Test F1 Score: {f1:.4f}")
+    print(f"Test MCC: {mcc:.4f}")
+    print(f"Test Cohen's Kappa: {kappa:.4f}")
+    print(f"Test AUC: {auc_score}")
+
+# ------------------------ 12. Aggregate and Save Performance ------------------------
+def compute_mean_ci(metric_list):
+    mean_val = np.mean(metric_list)
+    std_err = np.std(metric_list, ddof=1) / np.sqrt(len(metric_list))
+    ci = 1.96 * std_err
+    return mean_val, (mean_val - ci, mean_val + ci)
+
+metrics_to_aggregate = ["test_loss", "accuracy", "precision", "recall", "f1", "mcc", "kappa", "auc"]
+aggregated_results = {}
+
+print("\n========== Aggregated Test Set Results Over Folds ==========")
+for metric in metrics_to_aggregate:
+    values = [fold_result[metric] for fold_result in fold_metrics if not np.isnan(fold_result[metric])]
+    mean_val, (ci_low, ci_high) = compute_mean_ci(values)
+    aggregated_results[metric] = {"mean": mean_val, "95% CI": (ci_low, ci_high)}
+    print(f"{metric.capitalize()}: Mean = {mean_val:.4f}, 95% CI = ({ci_low:.4f}, {ci_high:.4f})")
+
+df_fold_metrics = pd.DataFrame(fold_metrics)
+df_aggregated = pd.DataFrame({
+    metric: [aggregated_results[metric]["mean"], aggregated_results[metric]["95% CI"][0], aggregated_results[metric]["95% CI"][1]]
+    for metric in aggregated_results
+}).T
+df_aggregated.columns = ["Mean", "95% CI Low", "95% CI High"]
+
+output_dir = "./model_performance"
+os.makedirs(output_dir, exist_ok=True)
+model_name_tag = MODEL_ARCH.replace("/", "_")
+df_fold_metrics.to_csv(os.path.join(output_dir, f"fold_metrics_{model_name_tag}.csv"), index=False)
+df_aggregated.to_csv(os.path.join(output_dir, f"aggregated_metrics_{model_name_tag}.csv"))
+
+with open(os.path.join(output_dir, f"fold_histories_{model_name_tag}.pkl"), "wb") as f:
+    pickle.dump(fold_histories, f)
+
+print(f"\nSaved fold metrics, aggregated results, and fold histories to {output_dir}")
+
+# ------------------------ 13. Plot Combined Training/Validation Curves ------------------------
+plt.figure(figsize=(14, 6))
+
+plt.subplot(1, 2, 1)
+for fold, history in fold_histories.items():
+    plt.plot(history["epoch"], history["train_loss"], '--', label=f"{fold} Train Loss")
+    plt.plot(history["epoch"], history["val_loss"], '-', label=f"{fold} Val Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Training & Validation Loss (All Folds)")
+plt.legend()
+plt.grid(True)
+
+plt.subplot(1, 2, 2)
+for fold, history in fold_histories.items():
+    plt.plot(history["epoch"], history["train_accuracy"], '--', label=f"{fold} Train Acc")
+    plt.plot(history["epoch"], history["val_accuracy"], '-', label=f"{fold} Val Acc")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.title("Training & Validation Accuracy (All Folds)")
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ------------------------ 14. (Optional) Additional Visualizations for Last Fold ------------------------
+y_true_test, y_pred_test, y_scores_test, test_loss, _ = evaluate_model(model, test_loader, criterion, DEVICE)
+cm = confusion_matrix(y_true_test, y_pred_test)
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False)
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Confusion Matrix on Test Set (Last Fold)")
+plt.show()
+
+try:
+    auc_score = roc_auc_score(y_true_test, y_scores_test)
+except ValueError:
+    auc_score = None
+
+if auc_score is not None:
+    fpr, tpr, thresholds = roc_curve(y_true_test, y_scores_test)
+    plt.figure()
+    plt.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (AUC = {auc_score:.2f})")
+    plt.plot([0,1], [0,1], color="navy", lw=2, linestyle="--")
+    plt.xlim([-0.05, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("Receiver Operating Characteristic on Test Set (Last Fold)")
+    plt.legend(loc="lower right")
+    plt.grid(True)
+    plt.show()
+
+    precision_vals, recall_vals, thresholds_pr = precision_recall_curve(y_true_test, y_scores_test)
+    pr_auc = auc(recall_vals, precision_vals)
+    plt.figure()
+    plt.plot(recall_vals, precision_vals, color="darkorange", lw=2, label=f"PR curve (AUC = {pr_auc:.2f})")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curve on Test Set (Last Fold)")
+    plt.legend(loc="lower left")
+    plt.grid(True)
+    plt.show()
+else:
+    print("\nROC and Precision-Recall curves are not available for <2 classes.")
