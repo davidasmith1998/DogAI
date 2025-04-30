@@ -83,8 +83,8 @@ train_transform = transforms.Compose([
     transforms.RandomHorizontalFlip(),
     transforms.RandomVerticalFlip(),
     transforms.RandomAffine(degrees=20, translate=(0.1,0.1), scale=(0.9,1.1)),
-    transforms.ToTensor(),
     transforms.RandomErasing(p=0.5, scale=(0.1,0.15)),
+    transforms.ToTensor(),
     transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
 ])
 val_transform = transforms.Compose([
