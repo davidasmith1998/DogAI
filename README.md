@@ -1,5 +1,6 @@
 
 The expected folder structure for the scripts in this repository is as follows:
+
 (data/)
 └── train/
     ├── 0/  ← normal images
