@@ -11,8 +11,8 @@ The expected folder structure for the scripts in this repository is as follows:
 
 └── test/
     
-    ├── 0/
+    ├── 0/    ← normal images
     
-    └── 1/
+    └── 1/    ← disease images
 
 └── metadata.xlsx
